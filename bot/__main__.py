@@ -95,6 +95,7 @@ async def start(client, message):
     buttons = ButtonMaker()
     buttons.ubutton(BotTheme("ST_BN1_NAME"), BotTheme("ST_BN1_URL"))
     buttons.ubutton(BotTheme("ST_BN2_NAME"), BotTheme("ST_BN2_URL"))
+    buttons.ubutton(BotTheme("ST_BN3_NAME"), BotTheme("ST_BN3_URL"))
     reply_markup = buttons.build_menu(2)
     if len(message.command) > 1 and message.command[1] == "wzmlx":
         await deleteMessage(message)
