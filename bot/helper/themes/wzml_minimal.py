@@ -3,9 +3,11 @@ class WZMLStyle:
     # ----------------------
     # async def start(client, message) ---> __main__.py
     ST_BN1_NAME = '👑 𝐎ᴡɴᴇʀ'
-    ST_BN1_URL = 'https://t.me/Sunil_Sharma_2_0'
+    ST_BN1_URL = 'https://t.me/Sunil_Sharma_2_0_Bot'
     ST_BN2_NAME = '📢 𝐔ᴘᴅᴀᴛᴇs'
     ST_BN2_URL = 'https://t.me/SSBotsUpdates'
+    ST_BN3_NAME = ' 𝐁ᴀsᴇ 𝐑ᴇᴘᴏ'
+    ST_BN3_URL = 'https://github.com/SilentDemonSD/WZML-X/tree/master'
     ST_MSG = '''<b>🙏 𝐓ʜᴀɴᴋs 😇  
 𝐍ᴏᴡ, 𝐈 𝐖ɪʟʟ 𝐒ᴇɴᴅ 𝐀ʟʟ 𝐘ᴏᴜʀ 𝐋ᴇᴇᴄʜ/𝐌ɪʀʀᴏʀ 𝐅ɪʟᴇs & 𝐋ɪɴᴋs 𝐇ᴇʀᴇ.  
 🚀 𝐒ᴛᴀʀᴛ 𝐔sɪɴɢ 𝐌ᴇ 𝐈ɴ 𝐆ʀᴏᴜᴘ & 𝐄ɴᴊᴏʏ ❤️</b>'''
