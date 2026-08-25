@@ -1,140 +1,129 @@
+#!/usr/bin/env python3
 """
-update.py — HK-Deploy deployment helper for SSLeech on Heroku.
+update.py — wzv3-style clean update for SSLeech on Heroku.
 
 MINIMUM required Heroku config vars (only these 2 are truly mandatory):
   BOT_TOKEN     — identifies which MongoDB partition to load
   DATABASE_URL  — MongoDB connection string
 
 Everything else (UPSTREAM_REPO, UPSTREAM_BRANCH, TELEGRAM_API, TELEGRAM_HASH,
-OWNER_ID, etc.) is loaded from MongoDB automatically.
-You only need them in Heroku config vars for the VERY FIRST boot.
+OWNER_ID, etc.) is saved in MongoDB via /botsettings and loaded automatically.
+You need them in Heroku config vars only for the VERY FIRST boot.
 After that they persist in MongoDB and can be removed from Heroku.
 
-Key fixes vs original:
-  1. config.env bridge — all MongoDB vars written to config.env AFTER git reset
-     so bot/__init__.py can read them via load_dotenv (process boundary fix).
-  2. uv --system — added so pip works outside a virtualenv.
-  3. Venv-aware pip — if VIRTUAL_ENV is set (Heroku buildpack), uses the venv's
-     own pip instead of uv to avoid "no venv found" conflicts.
-  4. UPDATE_PKGS respected — True → -U upgrade, False → only install missing.
+Design (wzv3-inspired):
+  1. Read BOT_TOKEN + DATABASE_URL from Heroku env
+  2. Fetch ALL saved config vars from MongoDB → inject into os.environ
+     (saves the raw doc so we can write it to config.env after git reset)
+  3. Clean `git reset --hard origin/<branch>`
+  4. Write MongoDB vars to config.env AFTER git reset so bot/__init__.py
+     can read them even if its own MongoDB call is slow/fails
+     (this is the key fix: update.py is a subprocess — os.environ changes
+     do NOT carry over to `osexecl(python -m bot)` in the parent process)
+  5. pip install -U (upgrade) from the freshly pulled requirements.txt
 """
 
 from logging import ERROR, INFO, FileHandler, StreamHandler, basicConfig, getLogger
-from os import environ, path
+from os import environ, path, remove
 from subprocess import call as scall
 from subprocess import run as srun
 from sys import exit
 
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
+try:
+    from pymongo.server_api import ServerApi as _ServerApi
+    _MONGO_SERVER_API = _ServerApi("1")
+except ImportError:
+    _MONGO_SERVER_API = None
 
 getLogger("pymongo").setLevel(ERROR)
-
-basicConfig(
-    format="[%(asctime)s] [%(levelname)s] - %(message)s",
-    datefmt="%d-%b-%y %I:%M:%S %p",
-    handlers=[FileHandler("log.txt"), StreamHandler()],
-    level=INFO,
-)
 _LOGGER = getLogger("update")
 
-# ── Step 1: BOT_TOKEN (only truly mandatory Heroku var) ───────────────────────
-BOT_TOKEN = environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    # Fallback: try config.env from a previous run
+
+def _setup_logging():
+    for f in ("log.txt", "rlog.txt"):
+        if path.exists(f):
+            with open(f, "w"):
+                pass
+    basicConfig(
+        format="[%(asctime)s] [%(levelname)s] - %(message)s",
+        datefmt="%d-%b-%y %I:%M:%S %p",
+        handlers=[FileHandler("log.txt"), StreamHandler()],
+        level=INFO,
+    )
+
+
+def _get_essential(key):
+    """Read a var from Heroku env; also check config.env as fallback."""
+    val = environ.get(key, "").strip()
+    if val:
+        return val
+    # Fallback: try reading config.env directly (may exist from previous run)
     if path.exists("config.env"):
         for line in open("config.env"):
             line = line.strip()
-            if line.startswith("BOT_TOKEN="):
-                BOT_TOKEN = line[len("BOT_TOKEN="):].strip().strip('"').strip("'")
-                break
-if not BOT_TOKEN:
-    _LOGGER.error("BOT_TOKEN is missing! Set it in Heroku config vars. Exiting.")
-    exit(1)
+            if line.startswith(f"{key}="):
+                return line[len(key) + 1 :].strip().strip('"').strip("'")
+    return ""
 
-BOT_ID = BOT_TOKEN.split(":", 1)[0]
-DATABASE_URL = environ.get("DATABASE_URL", "").strip()
 
-# Fallback DATABASE_URL from config.env
-if not DATABASE_URL and path.exists("config.env"):
-    for line in open("config.env"):
-        line = line.strip()
-        if line.startswith("DATABASE_URL="):
-            DATABASE_URL = line[len("DATABASE_URL="):].strip().strip('"').strip("'")
-            break
+def _fetch_config_from_db(database_url, bot_id):
+    """
+    Connect to MongoDB and:
+      1. Inject ALL saved config vars into os.environ (Heroku vars take priority).
+      2. Return (UPSTREAM_REPO, UPSTREAM_BRANCH, raw_doc).
 
-# ── Step 2: Load ALL config from MongoDB ─────────────────────────────────────
-# Reads every saved botsetting into os.environ (Heroku vars take priority).
-# Also returns the raw doc so we can write it to config.env after git reset.
-UPSTREAM_REPO   = environ.get("UPSTREAM_REPO", "").strip()
-UPSTREAM_BRANCH = environ.get("UPSTREAM_BRANCH", "").strip()
-UPDATE_PKGS     = environ.get("UPDATE_PKGS", "True").strip()
-db_doc = None
+    The raw_doc is returned so we can write it to config.env AFTER git reset,
+    bridging the process boundary between update.py and `python -m bot`.
 
-if DATABASE_URL:
+    WHY: update.py runs as a subprocess of _do_restart(). os.environ changes
+    here are NOT inherited by osexecl(python -m bot) in the parent process.
+    Writing to config.env is the reliable cross-process handoff.
+    """
     try:
-        conn = MongoClient(DATABASE_URL, server_api=ServerApi("1"), serverSelectionTimeoutMS=8000)
-        db   = conn.wzmlx
-        db_doc = db.settings.config.find_one({"_id": BOT_ID})
-        if db_doc:
+        from pymongo import MongoClient
+
+        _kwargs = {"serverSelectionTimeoutMS": 8000}
+        if _MONGO_SERVER_API:
+            _kwargs["server_api"] = _MONGO_SERVER_API
+        conn = MongoClient(database_url, **_kwargs)
+        doc = conn.wzmlx.settings.config.find_one({"_id": bot_id})
+        conn.close()
+        if doc:
             loaded = 0
-            for key, value in db_doc.items():
+            for key, value in doc.items():
                 if key == "_id" or value is None:
                     continue
-                # Heroku config vars already set take priority — don't overwrite
+                # Heroku config vars already in environ take priority
                 if not environ.get(key):
-                    environ[key] = str(value).strip()
+                    environ[key] = str(value)
                     loaded += 1
-            _LOGGER.info(f"MongoDB: loaded {loaded} config var(s) into environ.")
-            # Use MongoDB UPSTREAM_* / UPDATE_PKGS if not set in Heroku env
-            UPSTREAM_REPO   = environ.get("UPSTREAM_REPO", UPSTREAM_REPO).strip()
-            UPSTREAM_BRANCH = environ.get("UPSTREAM_BRANCH", UPSTREAM_BRANCH).strip()
-            UPDATE_PKGS     = environ.get("UPDATE_PKGS", UPDATE_PKGS).strip()
-        conn.close()
+            _LOGGER.info(f"MongoDB: {loaded} config var(s) pre-loaded into environment.")
+            repo   = str(doc.get("UPSTREAM_REPO")   or "").strip()
+            branch = str(doc.get("UPSTREAM_BRANCH") or "").strip()
+            return repo, branch, doc
     except Exception as e:
         _LOGGER.warning(f"MongoDB: could not load config — {e}")
-else:
-    _LOGGER.warning(
-        "DATABASE_URL not set — skipping MongoDB load. "
-        "All required vars must be present in Heroku config vars."
-    )
+    return "", "", None
 
-UPSTREAM_BRANCH = UPSTREAM_BRANCH or "ssleech-hk"
 
-# ── Step 3: git reset to upstream ────────────────────────────────────────────
-if UPSTREAM_REPO:
-    if path.exists(".git"):
-        srun(["rm", "-rf", ".git"])
+def _write_config_env(db_doc):
+    """
+    Write MongoDB config vars into config.env so bot/__init__.py can read them
+    via load_dotenv("config.env", override=False).
 
-    update = srun(
-        f"git init -q "
-        f"&& git config --global user.email bot@ssleech.local "
-        f"&& git config --global user.name SSLeech "
-        f"&& git add . "
-        f"&& git commit -sm update -q "
-        f"&& git remote add origin {UPSTREAM_REPO} "
-        f"&& git fetch origin -q "
-        f"&& git reset --hard origin/{UPSTREAM_BRANCH} -q",
-        shell=True,
-    )
-    _display = UPSTREAM_REPO.rstrip("/").rsplit("/", 2)
-    _display = f"https://github.com/{_display[-2]}/{_display[-1]}" if len(_display) >= 3 else UPSTREAM_REPO
-    if update.returncode == 0:
-        _LOGGER.info("Successfully updated with Latest Updates !")
-    else:
-        _LOGGER.error("Git update failed! Check UPSTREAM_REPO/UPSTREAM_BRANCH.")
-    _LOGGER.info(f"UPSTREAM_REPO: {_display} | UPSTREAM_BRANCH: {UPSTREAM_BRANCH}")
-else:
-    _LOGGER.warning("UPSTREAM_REPO not set — skipping git update.")
+    This is called AFTER git reset so we write on top of whatever the upstream
+    repo may have left in config.env. Heroku env vars are written first so
+    load_dotenv's override=False keeps them (Heroku vars are in os.environ
+    already, so load_dotenv won't touch them regardless).
 
-# ── Step 4: Write ALL MongoDB vars to config.env AFTER git reset ─────────────
-# Critical fix: update.py runs as a subprocess. Any os.environ changes here do
-# NOT reach the parent process or the subsequent `python3 -m bot` in start.sh.
-# Writing to config.env is the only reliable way to pass MongoDB vars across
-# the process boundary. bot/__init__.py reads this via load_dotenv().
-_SKIP_KEYS = {"_id", "_____REMOVE_THIS_LINE_____"}
+    Values that are None, empty string, or the literal string "None" are
+    skipped — we don't want to blank out defaults in the bot.
+    """
+    if not db_doc:
+        return
 
-if db_doc:
+    _SKIP_KEYS = {"_id", "_____REMOVE_THIS_LINE_____"}
+
     lines = [
         "# Auto-generated by update.py from MongoDB — do not edit manually.",
         "# These values were saved via /botsettings and loaded on startup.",
@@ -142,14 +131,18 @@ if db_doc:
     ]
     written = 0
     for key, value in db_doc.items():
-        if key in _SKIP_KEYS or value is None:
+        if key in _SKIP_KEYS:
+            continue
+        if value is None:
             continue
         str_val = str(value).strip()
         if str_val in ("", "None"):
             continue
-        str_val_esc = str_val.replace('"', '\\"')
-        lines.append(f'{key}="{str_val_esc}"')
+        # Escape any double-quotes inside the value
+        str_val_escaped = str_val.replace('"', '\\"')
+        lines.append(f'{key}="{str_val_escaped}"')
         written += 1
+
     try:
         with open("config.env", "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -158,50 +151,200 @@ if db_doc:
             "(bot/__init__.py will read them via load_dotenv)."
         )
     except Exception as e:
-        _LOGGER.warning(f"Could not write config.env: {e}")
+        _LOGGER.warning(f"Could not write config.env from MongoDB doc: {e}")
 
-# ── Step 5: Install / upgrade packages ───────────────────────────────────────
-# UPDATE_PKGS == True  → install with -U (upgrade to latest compatible)
-# UPDATE_PKGS == False → only install missing packages
-_do_upgrade = True
-if isinstance(UPDATE_PKGS, str):
-    _do_upgrade = UPDATE_PKGS.lower() not in ("false", "0", "no")
-elif isinstance(UPDATE_PKGS, bool):
-    _do_upgrade = UPDATE_PKGS
 
-_LOGGER.info(f"Updating packages (UPDATE_PKGS={_do_upgrade}) ...")
+def _run_update(upstream_repo, upstream_branch):
+    """
+    wzv3-style clean git reset — pulls latest code from upstream.
+    config.env is gitignored so it survives; we rewrite it from MongoDB
+    AFTER this call anyway (see _write_config_env).
+    """
+    if not upstream_repo:
+        _LOGGER.info("No UPSTREAM_REPO set — skipping git update.")
+        return
 
-from shutil import which as _which
+    # ── Preserve runtime files that must survive git reset ────────────────────
+    # .restartmsg holds (chat_id, msg_id) written by _do_restart() so the bot
+    # can edit "Restarting…" → "Restarted Successfully!" after coming back up.
+    _RUNTIME_FILES = [".restartmsg"]
+    _saved = {}
+    for _f in _RUNTIME_FILES:
+        if path.exists(_f):
+            with open(_f, "r") as _fh:
+                _saved[_f] = _fh.read()
 
-# If inside an activated virtualenv (Heroku buildpack may set VIRTUAL_ENV),
-# use the venv's own pip to avoid "uv: No virtual environment found" conflicts.
-_venv = environ.get("VIRTUAL_ENV", "").strip()
-_venv_pip = path.join(_venv, "bin", "pip") if _venv else ""
+    if path.exists(".git"):
+        srun(["rm", "-rf", ".git"], capture_output=True)
 
-if _venv and path.exists(_venv_pip):
-    _uflag   = "--upgrade " if _do_upgrade else ""
-    _pip_cmd = f"{_venv_pip} install {_uflag}-r requirements.txt -q --no-warn-script-location"
-    _LOGGER.info(f"Package installer: venv pip ({_venv_pip})")
-else:
-    _uv = _which("uv")
-    if _uv:
-        _uflag   = "-U " if _do_upgrade else ""
-        _pip_cmd = f"{_uv} pip install --system {_uflag}-r requirements.txt -q"
-        _LOGGER.info(f"Package installer: uv ({_uv})")
-    else:
-        _pip_candidates = ["/wzvenv/bin/pip", "/usr/local/bin/pip3", "/usr/local/bin/pip"]
-        _pip_bin = next((p for p in _pip_candidates if path.exists(p)), None)
-        if not _pip_bin:
-            _pip_bin = _which("pip3") or _which("pip") or "pip3"
-        _uflag   = "--upgrade " if _do_upgrade else ""
-        _pip_cmd = (
-            f"{_pip_bin} install {_uflag}-r requirements.txt -q "
-            "--no-warn-script-location --break-system-packages"
+    cmds = [
+        ["git", "init", "-q"],
+        ["git", "config", "--global", "user.email", "bot@heroku.local"],
+        ["git", "config", "--global", "user.name", "SSLeechBot"],
+        ["git", "add", "."],
+        ["git", "commit", "-sm", "pre-update", "-q"],
+        ["git", "remote", "add", "origin", upstream_repo],
+        ["git", "fetch", "origin", upstream_branch, "-q"],
+        ["git", "reset", "--hard", f"origin/{upstream_branch}", "-q"],
+    ]
+
+    result = None
+    for cmd in cmds:
+        result = srun(cmd, capture_output=True)
+        if result.returncode != 0:
+            _LOGGER.error(
+                f"git command failed: {' '.join(cmd)}\n"
+                f"stderr: {result.stderr.decode().strip()}"
+            )
+            break
+
+    # ── Restore preserved runtime files ───────────────────────────────────────
+    for _f, _content in _saved.items():
+        with open(_f, "w") as _fh:
+            _fh.write(_content)
+
+    if result and result.returncode == 0:
+        _LOGGER.info("Successfully updated with latest commits !!")
+        display = "/".join(upstream_repo.split("/")[-2:]).replace(".git", "")
+        _LOGGER.info(
+            f"UPSTREAM_REPO: {display} | UPSTREAM_BRANCH: {upstream_branch}"
         )
-        _LOGGER.info(f"Package installer: pip ({_pip_bin})")
+    else:
+        _LOGGER.error(
+            "Update failed! Check UPSTREAM_REPO/UPSTREAM_BRANCH in botsettings "
+            "or Heroku config vars."
+        )
 
-ret = scall(_pip_cmd, shell=True)
-if ret == 0:
-    _LOGGER.info("Successfully Updated all the Packages !")
-else:
-    _LOGGER.warning("Package install had warnings — continuing anyway.")
+
+def _update_packages():
+    """
+    Install / upgrade packages from requirements.txt.
+
+    Always uses --upgrade (-U) so that when the upstream repo updates version
+    pins in requirements.txt, those new versions are actually installed.
+    Without -U, pip skips packages that are already installed at ANY compatible
+    version — meaning upstream library updates never reach a running bot.
+
+    UPGRADE_PACKAGES botsetting (True/False):
+      True  → force --upgrade (install latest compatible for every package)
+      False → only install missing packages, keep existing versions
+
+    Priority for installer:
+      1. uv  — fast Rust-based installer (--system required outside a venv).
+      2. /wzvenv/bin/pip — venv bundled in some base images.
+      3. System pip (pip3 / pip) — PEP-668 safe with --break-system-packages.
+    """
+    from shutil import which
+
+    # UPGRADE_PACKAGES or UPDATE_PKGS (alias) may be loaded from MongoDB/Heroku.
+    # Default = True so every restart pulls the latest lib versions from upstream.
+    upgrade = (
+        environ.get("UPGRADE_PACKAGES") or environ.get("UPDATE_PKGS") or "true"
+    ).lower().strip()
+    force_upgrade = upgrade not in ("false", "0", "no")
+
+    _LOGGER.info(
+        f"Updating packages (UPGRADE_PACKAGES={force_upgrade}) ..."
+    )
+
+    # ── Installer selection ──────────────────────────────────────────────────
+    # Priority:
+    #   1. Activated venv pip (VIRTUAL_ENV is set — Heroku buildpack activates
+    #      one via start.sh). Using the venv's own pip avoids the
+    #      "uv: No virtual environment found" error that occurs when uv is
+    #      called with --system inside an already-activated venv.
+    #   2. uv --system (fast, used only when NOT inside a venv)
+    #   3. /wzvenv/bin/pip → pip3 → pip (fallback)
+
+    venv_dir = environ.get("VIRTUAL_ENV", "").strip()
+    venv_pip  = path.join(venv_dir, "bin", "pip") if venv_dir else ""
+
+    if venv_dir and path.exists(venv_pip):
+        upgrade_flag = "--upgrade " if force_upgrade else ""
+        pip_cmd = (
+            f"{venv_pip} install {upgrade_flag}-r requirements.txt -q "
+            "--no-warn-script-location"
+        )
+        _LOGGER.info(f"Package installer: venv pip ({venv_pip})")
+    else:
+        uv_bin = which("uv")
+        if uv_bin:
+            upgrade_flag = "-U " if force_upgrade else ""
+            pip_cmd = f"{uv_bin} pip install --system {upgrade_flag}-r requirements.txt -q"
+            _LOGGER.info(f"Package installer: uv ({uv_bin})")
+        else:
+            _pip_candidates = ["/wzvenv/bin/pip", "/usr/local/bin/pip"]
+            _pip_bin = next((p for p in _pip_candidates if path.exists(p)), None)
+            if not _pip_bin:
+                _pip_bin = which("pip3") or which("pip") or "pip3"
+            upgrade_flag = "--upgrade " if force_upgrade else ""
+            pip_cmd = (
+                f"{_pip_bin} install {upgrade_flag}-r requirements.txt -q "
+                "--no-warn-script-location "
+                "--break-system-packages"
+            )
+            _LOGGER.info(f"Package installer: pip ({_pip_bin})")
+
+    ret = scall(pip_cmd, shell=True)
+    if ret == 0:
+        _LOGGER.info("Successfully Updated all the Packages !")
+    else:
+        _LOGGER.warning("Package install had warnings — continuing anyway.")
+
+
+def main():
+    _setup_logging()
+
+    # ── Step 1: Read BOT_TOKEN (only mandatory Heroku config var) ─────────────
+    bot_token = _get_essential("BOT_TOKEN")
+    if not bot_token:
+        _LOGGER.error(
+            "BOT_TOKEN is missing!\n"
+            "  BOT_TOKEN must be set in Heroku config vars (Settings → Config Vars).\n"
+            "  It identifies which MongoDB partition to load — it cannot be auto-loaded."
+        )
+        exit(1)
+
+    database_url = _get_essential("DATABASE_URL")
+    bot_id = bot_token.split(":", 1)[0]
+
+    # ── Step 2: Load ALL config from MongoDB ──────────────────────────────────
+    # This loads UPSTREAM_REPO, UPSTREAM_BRANCH, UPGRADE_PACKAGES, and all other
+    # botsettings vars into os.environ and returns the raw doc for config.env.
+    upstream_repo   = _get_essential("UPSTREAM_REPO")
+    upstream_branch = _get_essential("UPSTREAM_BRANCH")
+    db_doc = None
+
+    if database_url:
+        db_repo, db_branch, db_doc = _fetch_config_from_db(database_url, bot_id)
+        # MongoDB values are used only when Heroku env is empty
+        if db_repo and not upstream_repo:
+            upstream_repo = db_repo
+            _LOGGER.info("MongoDB: UPSTREAM_REPO loaded from database.")
+        if db_branch and not upstream_branch:
+            upstream_branch = db_branch
+    else:
+        _LOGGER.warning(
+            "DATABASE_URL not set — skipping MongoDB load. "
+            "All required vars must be in Heroku config vars."
+        )
+
+    upstream_branch = upstream_branch or "ssleech-hk"
+
+    # ── Step 3: Pull upstream code (gets updated requirements.txt) ────────────
+    _run_update(upstream_repo, upstream_branch)
+
+    # ── Step 4: Write MongoDB vars to config.env AFTER git reset ─────────────
+    # Critical fix: update.py runs as a subprocess of _do_restart(). Any changes
+    # to os.environ here do NOT propagate to the parent's osexecl(python -m bot).
+    # Writing to config.env is the only reliable way to pass MongoDB vars across
+    # the process boundary. bot/__init__.py reads this via load_dotenv().
+    if db_doc:
+        _write_config_env(db_doc)
+
+    # ── Step 5: Install packages from the freshly pulled requirements.txt ─────
+    _update_packages()
+
+
+if __name__ == "__main__":
+    main()
