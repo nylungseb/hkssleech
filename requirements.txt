@@ -31,7 +31,7 @@ speedtest-cli
 telegraph
 tenacity
 pytgcrypto
-uvloop
+uvloop==0.21.0
 uv
 xattr
 yt-dlp[default,curl-cffi]
